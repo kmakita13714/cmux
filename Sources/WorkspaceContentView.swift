@@ -44,6 +44,12 @@ struct TmuxOverlayExperimentSettings {
     }
 }
 
+private enum WorkspaceTitlebarInteractionMetrics {
+    // Keep in sync with Bonsplit's tab bar height so the monitor only covers
+    // the minimal-mode titlebar strip.
+    static let minimalModeTopStripHeight: CGFloat = 30
+}
+
 struct TmuxPaneLayoutPane: Codable, Equatable, Sendable {
     let paneId: String
     let left: Int
@@ -256,6 +262,7 @@ struct WorkspaceContentView: View {
         // Inactive workspaces are kept alive in a ZStack (for state preservation) but their
         // AppKit-backed views can still intercept drags. Disable drop acceptance for them.
         let _ = { workspace.bonsplitController.isInteractive = isWorkspaceInputActive }()
+
 
         // Wire up file drop handling so bonsplit's PaneDragContainerView can forward
         // Finder file drops to the correct terminal panel.

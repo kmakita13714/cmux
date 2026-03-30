@@ -8,6 +8,40 @@ import Darwin
 import Network
 import CoreText
 
+struct CmuxSurfaceConfigTemplate {
+    var fontSize: Float32 = 0
+    var workingDirectory: String?
+    var command: String?
+    var environmentVariables: [String: String] = [:]
+    var initialInput: String?
+    var waitAfterCommand: Bool = false
+
+    init() {}
+
+    init(cConfig: ghostty_surface_config_s) {
+        fontSize = cConfig.font_size
+        if let workingDirectory = cConfig.working_directory {
+            self.workingDirectory = String(cString: workingDirectory, encoding: .utf8)
+        }
+        if let command = cConfig.command {
+            self.command = String(cString: command, encoding: .utf8)
+        }
+        if let initialInput = cConfig.initial_input {
+            self.initialInput = String(cString: initialInput, encoding: .utf8)
+        }
+        if cConfig.env_var_count > 0, let envVars = cConfig.env_vars {
+            for index in 0..<Int(cConfig.env_var_count) {
+                let envVar = envVars[index]
+                if let key = String(cString: envVar.key, encoding: .utf8),
+                   let value = String(cString: envVar.value, encoding: .utf8) {
+                    environmentVariables[key] = value
+                }
+            }
+        }
+        waitAfterCommand = cConfig.wait_after_command
+    }
+}
+
 func cmuxSurfaceContextName(_ context: ghostty_surface_context_e) -> String {
     switch context {
     case GHOSTTY_SURFACE_CONTEXT_WINDOW:
@@ -21,20 +55,27 @@ func cmuxSurfaceContextName(_ context: ghostty_surface_context_e) -> String {
     }
 }
 
+private func cmuxPointerAppearsLive(_ pointer: UnsafeMutableRawPointer?) -> Bool {
+    guard let pointer,
+          malloc_zone_from_ptr(pointer) != nil else {
+        return false
+    }
+    return malloc_size(pointer) > 0
+}
+
+func cmuxSurfacePointerAppearsLive(_ surface: ghostty_surface_t) -> Bool {
+    // Best-effort check: reject pointers that no longer belong to an active
+    // malloc zone allocation. A Swift wrapper around `ghostty_surface_t` can
+    // remain non-nil after the backing native surface has already been freed.
+    cmuxPointerAppearsLive(surface)
+}
+
 func cmuxCurrentSurfaceFontSizePoints(_ surface: ghostty_surface_t) -> Float? {
-    guard let quicklookFont = ghostty_surface_quicklook_font(surface) else {
+    guard cmuxSurfacePointerAppearsLive(surface) else {
         return nil
     }
 
-    // Best-effort check: reject pointers that are not the start of a live
-    // malloc allocation. ghostty_surface_quicklook_font returns an unretained
-    // pointer whose lifetime is managed by Ghostty; on Intel Macs the pointer
-    // can become stale after the internal font is freed (#1496, #1870).
-    // malloc_size is safe to call with any address (returns 0 for non-malloc
-    // pointers without dereferencing them). This does not guarantee the memory
-    // still contains a valid CTFont, but it catches the common case of
-    // fully-freed or unmapped allocations that would otherwise SIGSEGV.
-    guard malloc_size(quicklookFont) > 0 else {
+    guard let quicklookFont = ghostty_surface_quicklook_font(surface) else {
         return nil
     }
 
@@ -47,21 +88,21 @@ func cmuxCurrentSurfaceFontSizePoints(_ surface: ghostty_surface_t) -> Float? {
 func cmuxInheritedSurfaceConfig(
     sourceSurface: ghostty_surface_t,
     context: ghostty_surface_context_e
-) -> ghostty_surface_config_s {
+) -> CmuxSurfaceConfigTemplate {
     let inherited = ghostty_surface_inherited_config(sourceSurface, context)
-    var config = inherited
+    var config = CmuxSurfaceConfigTemplate(cConfig: inherited)
 
     // Make runtime zoom inheritance explicit, even when Ghostty's
     // inherit-font-size config is disabled.
     let runtimePoints = cmuxCurrentSurfaceFontSizePoints(sourceSurface)
     if let points = runtimePoints {
-        config.font_size = points
+        config.fontSize = points
     }
 
 #if DEBUG
     let inheritedText = String(format: "%.2f", inherited.font_size)
     let runtimeText = runtimePoints.map { String(format: "%.2f", $0) } ?? "nil"
-    let finalText = String(format: "%.2f", config.font_size)
+    let finalText = String(format: "%.2f", config.fontSize)
     dlog(
         "zoom.inherit context=\(cmuxSurfaceContextName(context)) " +
         "inherited=\(inheritedText) runtime=\(runtimeText) final=\(finalText)"
@@ -596,10 +637,9 @@ extension Workspace {
             applySessionPanelMetadata(snapshot, toPanelId: terminalPanel.id)
             return terminalPanel.id
         case .browser:
-            let initialURL = snapshot.browser?.urlString.flatMap { URL(string: $0) }
             guard let browserPanel = newBrowserSurface(
                 inPane: paneId,
-                url: initialURL,
+                url: nil,
                 focus: false,
                 preferredProfileID: snapshot.browser?.profileID
             ) else {
@@ -655,16 +695,12 @@ extension Workspace {
 
         if let browserSnapshot = snapshot.browser,
            let browserPanel = browserPanel(for: panelId) {
-            browserPanel.restoreSessionNavigationHistory(
-                backHistoryURLStrings: browserSnapshot.backHistoryURLStrings ?? [],
-                forwardHistoryURLStrings: browserSnapshot.forwardHistoryURLStrings ?? [],
-                currentURLString: browserSnapshot.urlString
-            )
-
             let pageZoom = CGFloat(max(0.25, min(5.0, browserSnapshot.pageZoom)))
             if pageZoom.isFinite {
                 _ = browserPanel.setPageZoomFactor(pageZoom)
             }
+
+            browserPanel.restoreSessionSnapshot(browserSnapshot)
 
             if browserSnapshot.developerToolsVisible {
                 _ = browserPanel.showDeveloperTools()
@@ -692,6 +728,227 @@ extension Workspace {
             applySessionDividerPositions(snapshotNode: snapshotSplit.second, liveNode: liveSplit.second)
         default:
             return
+        }
+    }
+}
+
+// MARK: - cmux.json custom layout
+
+extension Workspace {
+
+    func applyCustomLayout(_ layout: CmuxLayoutNode, baseCwd: String) {
+        guard let rootPaneId = bonsplitController.allPaneIds.first else { return }
+
+        var leaves: [(paneId: PaneID, surfaces: [CmuxSurfaceDefinition])] = []
+        buildCustomLayoutTree(layout, inPane: rootPaneId, leaves: &leaves)
+
+        // First leaf reuses the initial terminal created by addWorkspace;
+        // subsequent leaves were created via newTerminalSplit which also seeds
+        // a placeholder terminal.
+        var focusPanelId: UUID?
+        for leaf in leaves {
+            populateCustomPane(leaf.paneId, surfaces: leaf.surfaces, baseCwd: baseCwd, focusPanelId: &focusPanelId)
+        }
+
+        let liveRoot = bonsplitController.treeSnapshot()
+        applyCustomDividerPositions(configNode: layout, liveNode: liveRoot)
+
+        if let focusPanelId {
+            focusPanel(focusPanelId)
+        }
+    }
+
+    private func buildCustomLayoutTree(
+        _ node: CmuxLayoutNode,
+        inPane paneId: PaneID,
+        leaves: inout [(paneId: PaneID, surfaces: [CmuxSurfaceDefinition])]
+    ) {
+        switch node {
+        case .pane(let pane):
+            leaves.append((paneId: paneId, surfaces: pane.surfaces))
+
+        case .split(let split):
+            guard split.children.count == 2 else {
+                NSLog("[CmuxConfig] split node requires exactly 2 children, got %d", split.children.count)
+                leaves.append((paneId: paneId, surfaces: []))
+                return
+            }
+
+            var anchorPanelId = bonsplitController
+                .tabs(inPane: paneId)
+                .compactMap { panelIdFromSurfaceId($0.id) }
+                .first
+
+            if anchorPanelId == nil {
+                anchorPanelId = newTerminalSurface(inPane: paneId, focus: false)?.id
+            }
+
+            guard let anchorPanelId,
+                  let newSplitPanel = newTerminalSplit(
+                      from: anchorPanelId,
+                      orientation: split.splitOrientation,
+                      insertFirst: false,
+                      focus: false
+                  ),
+                  let secondPaneId = self.paneId(forPanelId: newSplitPanel.id) else {
+                leaves.append((paneId: paneId, surfaces: []))
+                return
+            }
+
+            buildCustomLayoutTree(split.children[0], inPane: paneId, leaves: &leaves)
+            buildCustomLayoutTree(split.children[1], inPane: secondPaneId, leaves: &leaves)
+        }
+    }
+
+    private func populateCustomPane(
+        _ paneId: PaneID,
+        surfaces: [CmuxSurfaceDefinition],
+        baseCwd: String,
+        focusPanelId: inout UUID?
+    ) {
+        let existingPanelIds = bonsplitController
+            .tabs(inPane: paneId)
+            .compactMap { panelIdFromSurfaceId($0.id) }
+
+        guard !surfaces.isEmpty else { return }
+
+        let firstSurface = surfaces[0]
+        if let placeholderPanelId = existingPanelIds.first {
+            configureExistingSurface(
+                panelId: placeholderPanelId,
+                inPane: paneId,
+                surface: firstSurface,
+                baseCwd: baseCwd,
+                focusPanelId: &focusPanelId
+            )
+        }
+
+        for surfaceIndex in 1..<surfaces.count {
+            createNewSurface(
+                inPane: paneId,
+                surface: surfaces[surfaceIndex],
+                baseCwd: baseCwd,
+                focusPanelId: &focusPanelId
+            )
+        }
+    }
+
+    private func configureExistingSurface(
+        panelId: UUID,
+        inPane paneId: PaneID,
+        surface: CmuxSurfaceDefinition,
+        baseCwd: String,
+        focusPanelId: inout UUID?
+    ) {
+        switch surface.type {
+        case .terminal where surface.cwd != nil || surface.env != nil:
+            // Placeholder can't change cwd/env — replace it
+            let resolvedCwd = CmuxConfigStore.resolveCwd(surface.cwd, relativeTo: baseCwd)
+            if let panel = newTerminalSurface(
+                inPane: paneId,
+                focus: false,
+                workingDirectory: resolvedCwd,
+                startupEnvironment: surface.env ?? [:]
+            ) {
+                _ = closePanel(panelId, force: true)
+                if let name = surface.name { setPanelCustomTitle(panelId: panel.id, title: name) }
+                if surface.focus == true { focusPanelId = panel.id }
+                if let command = surface.command { sendInputWhenReady(command + "\n", to: panel) }
+            }
+
+        case .terminal:
+            if let name = surface.name { setPanelCustomTitle(panelId: panelId, title: name) }
+            if surface.focus == true { focusPanelId = panelId }
+            if let command = surface.command, let terminal = terminalPanel(for: panelId) {
+                sendInputWhenReady(command + "\n", to: terminal)
+            }
+
+        case .browser:
+            let url = surface.url.flatMap { URL(string: $0) }
+            if let panel = newBrowserSurface(inPane: paneId, url: url, focus: false) {
+                _ = closePanel(panelId, force: true)
+                if let name = surface.name { setPanelCustomTitle(panelId: panel.id, title: name) }
+                if surface.focus == true { focusPanelId = panel.id }
+            }
+        }
+    }
+
+    private func createNewSurface(
+        inPane paneId: PaneID,
+        surface: CmuxSurfaceDefinition,
+        baseCwd: String,
+        focusPanelId: inout UUID?
+    ) {
+        switch surface.type {
+        case .terminal:
+            let resolvedCwd = CmuxConfigStore.resolveCwd(surface.cwd, relativeTo: baseCwd)
+            if let panel = newTerminalSurface(
+                inPane: paneId,
+                focus: false,
+                workingDirectory: resolvedCwd,
+                startupEnvironment: surface.env ?? [:]
+            ) {
+                if let name = surface.name { setPanelCustomTitle(panelId: panel.id, title: name) }
+                if surface.focus == true { focusPanelId = panel.id }
+                if let command = surface.command { sendInputWhenReady(command + "\n", to: panel) }
+            }
+
+        case .browser:
+            let url = surface.url.flatMap { URL(string: $0) }
+            if let panel = newBrowserSurface(inPane: paneId, url: url, focus: false) {
+                if let name = surface.name { setPanelCustomTitle(panelId: panel.id, title: name) }
+                if surface.focus == true { focusPanelId = panel.id }
+            }
+        }
+    }
+
+    private func applyCustomDividerPositions(
+        configNode: CmuxLayoutNode,
+        liveNode: ExternalTreeNode
+    ) {
+        switch (configNode, liveNode) {
+        case (.split(let configSplit), .split(let liveSplit)):
+            if let splitID = UUID(uuidString: liveSplit.id) {
+                _ = bonsplitController.setDividerPosition(
+                    CGFloat(configSplit.clampedSplitPosition),
+                    forSplit: splitID,
+                    fromExternal: true
+                )
+            }
+            if configSplit.children.count == 2 {
+                applyCustomDividerPositions(configNode: configSplit.children[0], liveNode: liveSplit.first)
+                applyCustomDividerPositions(configNode: configSplit.children[1], liveNode: liveSplit.second)
+            }
+        default:
+            break
+        }
+    }
+
+    private func sendInputWhenReady(_ text: String, to panel: TerminalPanel) {
+        if panel.surface.surface != nil {
+            panel.sendInput(text)
+            return
+        }
+
+        var resolved = false
+        var observer: NSObjectProtocol?
+
+        observer = NotificationCenter.default.addObserver(
+            forName: .terminalSurfaceDidBecomeReady,
+            object: panel.surface,
+            queue: .main
+        ) { [weak panel] _ in
+            guard !resolved, let panel else { return }
+            resolved = true
+            if let observer { NotificationCenter.default.removeObserver(observer) }
+            panel.sendInput(text)
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+            guard !resolved else { return }
+            resolved = true
+            if let observer { NotificationCenter.default.removeObserver(observer) }
+            NSLog("[CmuxConfig] surface not ready after 3s, dropping command (%d chars)", text.count)
         }
     }
 }
@@ -2232,6 +2489,7 @@ private final class WorkspaceRemoteProxyBroker {
         var tunnel: WorkspaceRemoteDaemonProxyTunnel?
         var endpoint: BrowserProxyEndpoint?
         var restartWorkItem: DispatchWorkItem?
+        var restartRetryCount = 0
         var subscribers: [UUID: (Update) -> Void] = [:]
 
         init(configuration: WorkspaceRemoteConfiguration, remotePath: String) {
@@ -2258,6 +2516,7 @@ private final class WorkspaceRemoteProxyBroker {
                 entry = existing
                 if existing.remotePath != remotePath {
                     existing.remotePath = remotePath
+                    existing.restartRetryCount = 0
                     if existing.tunnel != nil {
                         stopEntryRuntimeLocked(existing)
                         notifyLocked(existing, update: .connecting)
@@ -2301,12 +2560,13 @@ private final class WorkspaceRemoteProxyBroker {
             // Internal deterministic test hook used by docker regressions to force bind conflicts.
             localPort = forcedLocalPort
         } else {
+            let retryDelay = Self.retryDelay(baseDelay: 3.0, retry: entry.restartRetryCount + 1)
             guard let allocatedPort = Self.allocateLoopbackPort() else {
                 notifyLocked(
                     entry,
-                    update: .error("Failed to allocate local proxy port\(Self.retrySuffix(delay: 3.0))")
+                    update: .error("Failed to allocate local proxy port\(Self.retrySuffix(delay: retryDelay))")
                 )
-                scheduleRestartLocked(key: key, entry: entry, delay: 3.0)
+                scheduleRestartLocked(key: key, entry: entry, baseDelay: 3.0)
                 return
             }
             localPort = allocatedPort
@@ -2326,28 +2586,33 @@ private final class WorkspaceRemoteProxyBroker {
             entry.tunnel = tunnel
             let endpoint = BrowserProxyEndpoint(host: "127.0.0.1", port: localPort)
             entry.endpoint = endpoint
+            entry.restartRetryCount = 0
             notifyLocked(entry, update: .ready(endpoint))
         } catch {
             stopEntryRuntimeLocked(entry)
             let detail = "Failed to start local daemon proxy: \(error.localizedDescription)"
-            notifyLocked(entry, update: .error("\(detail)\(Self.retrySuffix(delay: 3.0))"))
-            scheduleRestartLocked(key: key, entry: entry, delay: 3.0)
+            let retryDelay = Self.retryDelay(baseDelay: 3.0, retry: entry.restartRetryCount + 1)
+            notifyLocked(entry, update: .error("\(detail)\(Self.retrySuffix(delay: retryDelay))"))
+            scheduleRestartLocked(key: key, entry: entry, baseDelay: 3.0)
         }
     }
 
     private func handleTunnelFailureLocked(key: String, detail: String) {
         guard let entry = entries[key], entry.tunnel != nil else { return }
         stopEntryRuntimeLocked(entry)
-        notifyLocked(entry, update: .error("\(detail)\(Self.retrySuffix(delay: 3.0))"))
-        scheduleRestartLocked(key: key, entry: entry, delay: 3.0)
+        let retryDelay = Self.retryDelay(baseDelay: 3.0, retry: entry.restartRetryCount + 1)
+        notifyLocked(entry, update: .error("\(detail)\(Self.retrySuffix(delay: retryDelay))"))
+        scheduleRestartLocked(key: key, entry: entry, baseDelay: 3.0)
     }
 
-    private func scheduleRestartLocked(key: String, entry: Entry, delay: TimeInterval) {
+    private func scheduleRestartLocked(key: String, entry: Entry, baseDelay: TimeInterval) {
         guard !entry.subscribers.isEmpty else {
             teardownEntryLocked(key: key, entry: entry)
             return
         }
         guard entry.restartWorkItem == nil else { return }
+        entry.restartRetryCount += 1
+        let retryDelay = Self.retryDelay(baseDelay: baseDelay, retry: entry.restartRetryCount)
 
         let workItem = DispatchWorkItem { [weak self] in
             guard let self, let currentEntry = self.entries[key] else { return }
@@ -2361,7 +2626,7 @@ private final class WorkspaceRemoteProxyBroker {
         }
 
         entry.restartWorkItem = workItem
-        queue.asyncAfter(deadline: .now() + delay, execute: workItem)
+        queue.asyncAfter(deadline: .now() + retryDelay, execute: workItem)
     }
 
     private func teardownEntryLocked(key: String, entry: Entry) {
@@ -2429,6 +2694,11 @@ private final class WorkspaceRemoteProxyBroker {
     private static func retrySuffix(delay: TimeInterval) -> String {
         let seconds = max(1, Int(delay.rounded()))
         return " (retry in \(seconds)s)"
+    }
+
+    private static func retryDelay(baseDelay: TimeInterval, retry: Int) -> TimeInterval {
+        let exponent = Double(max(0, retry - 1))
+        return min(baseDelay * pow(2.0, exponent), 60.0)
     }
 }
 
@@ -2913,6 +3183,11 @@ private final class WorkspaceRemoteCLIRelayServer {
 }
 
 final class WorkspaceRemoteSessionController {
+    private struct RetrySchedule {
+        let retry: Int
+        let delay: TimeInterval
+    }
+
     private struct CommandResult {
         let status: Int32
         let stdout: String
@@ -3100,8 +3375,8 @@ final class WorkspaceRemoteSessionController {
             daemonReady = false
             daemonBootstrapVersion = nil
             daemonRemotePath = nil
-            let nextRetry = scheduleReconnectLocked(delay: 4.0)
-            let retrySuffix = Self.retrySuffix(retry: nextRetry, delay: 4.0)
+            let retrySchedule = scheduleReconnectLocked(baseDelay: 4.0)
+            let retrySuffix = Self.retrySuffix(retry: retrySchedule.retry, delay: retrySchedule.delay)
             let detail = "Remote daemon bootstrap failed: \(error.localizedDescription)\(retrySuffix)"
             publishDaemonStatus(.error, detail: detail)
             publishState(.error, detail: detail)
@@ -3114,8 +3389,8 @@ final class WorkspaceRemoteSessionController {
         guard proxyLease == nil else { return }
         guard let remotePath = daemonRemotePath,
               !remotePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            let nextRetry = scheduleReconnectLocked(delay: 4.0)
-            let retrySuffix = Self.retrySuffix(retry: nextRetry, delay: 4.0)
+            let retrySchedule = scheduleReconnectLocked(baseDelay: 4.0)
+            let retrySuffix = Self.retrySuffix(retry: retrySchedule.retry, delay: retrySchedule.delay)
             let detail = "Remote daemon did not provide a valid remote path\(retrySuffix)"
             publishDaemonStatus(.error, detail: detail)
             publishState(.error, detail: detail)
@@ -3331,8 +3606,8 @@ final class WorkspaceRemoteSessionController {
             daemonBootstrapVersion = nil
             daemonRemotePath = nil
 
-            let nextRetry = scheduleReconnectLocked(delay: 2.0)
-            let retrySuffix = Self.retrySuffix(retry: nextRetry, delay: 2.0)
+            let retrySchedule = scheduleReconnectLocked(baseDelay: 2.0)
+            let retrySuffix = Self.retrySuffix(retry: retrySchedule.retry, delay: retrySchedule.delay)
             publishDaemonStatus(
                 .error,
                 detail: "Remote daemon transport needs re-bootstrap after proxy failure\(retrySuffix)"
@@ -3341,11 +3616,12 @@ final class WorkspaceRemoteSessionController {
     }
 
     @discardableResult
-    private func scheduleReconnectLocked(delay: TimeInterval) -> Int {
-        guard !isStopping else { return reconnectRetryCount }
+    private func scheduleReconnectLocked(baseDelay: TimeInterval) -> RetrySchedule {
+        let retryNumber = reconnectRetryCount + 1
+        let retryDelay = Self.retryDelay(baseDelay: baseDelay, retry: retryNumber)
+        guard !isStopping else { return RetrySchedule(retry: retryNumber, delay: retryDelay) }
         reconnectWorkItem?.cancel()
-        reconnectRetryCount += 1
-        let retryNumber = reconnectRetryCount
+        reconnectRetryCount = retryNumber
         let workItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.reconnectWorkItem = nil
@@ -3354,8 +3630,8 @@ final class WorkspaceRemoteSessionController {
             self.beginConnectionAttemptLocked()
         }
         reconnectWorkItem = workItem
-        queue.asyncAfter(deadline: .now() + delay, execute: workItem)
-        return retryNumber
+        queue.asyncAfter(deadline: .now() + retryDelay, execute: workItem)
+        return RetrySchedule(retry: retryNumber, delay: retryDelay)
     }
 
     private func publishState(_ state: WorkspaceRemoteConnectionState, detail: String?) {
@@ -3923,7 +4199,29 @@ final class WorkspaceRemoteSessionController {
             .appendingPathComponent("cmuxd-remote", isDirectory: false)
     }
 
-    private func downloadRemoteDaemonBinaryLocked(entry: WorkspaceRemoteDaemonManifest.Entry, version: String) throws -> URL {
+    /// Fetch the live manifest JSON from the release, returning nil on any failure.
+    private static func fetchRemoteManifestLocked(releaseURL: String, version: String) -> WorkspaceRemoteDaemonManifest? {
+        guard let manifestURL = URL(string: "\(releaseURL)/cmuxd-remote-manifest.json") else { return nil }
+        let request = NSMutableURLRequest(url: manifestURL)
+        request.timeoutInterval = 15
+        request.setValue("cmux/\(version)", forHTTPHeaderField: "User-Agent")
+        let session = URLSession(configuration: .ephemeral)
+        let semaphore = DispatchSemaphore(value: 0)
+        var resultData: Data?
+        session.dataTask(with: request as URLRequest) { data, response, error in
+            defer { semaphore.signal() }
+            guard error == nil,
+                  let httpResponse = response as? HTTPURLResponse,
+                  (200...299).contains(httpResponse.statusCode) else { return }
+            resultData = data
+        }.resume()
+        _ = semaphore.wait(timeout: .now() + 20.0)
+        session.finishTasksAndInvalidate()
+        guard let data = resultData else { return nil }
+        return try? JSONDecoder().decode(WorkspaceRemoteDaemonManifest.self, from: data)
+    }
+
+    private func downloadRemoteDaemonBinaryLocked(entry: WorkspaceRemoteDaemonManifest.Entry, version: String, releaseURL: String? = nil) throws -> URL {
         guard let url = URL(string: entry.downloadURL) else {
             throw NSError(domain: "cmux.remote.daemon", code: 25, userInfo: [
                 NSLocalizedDescriptionKey: "remote daemon manifest has an invalid download URL",
@@ -3970,10 +4268,21 @@ final class WorkspaceRemoteSessionController {
         }
 
         let downloadedSHA = try Self.sha256Hex(forFile: downloadedURL)
-        guard downloadedSHA == entry.sha256.lowercased() else {
-            throw NSError(domain: "cmux.remote.daemon", code: 28, userInfo: [
-                NSLocalizedDescriptionKey: "remote daemon checksum mismatch for \(entry.assetName)",
-            ])
+        if downloadedSHA != entry.sha256.lowercased() {
+            // The embedded manifest's checksum doesn't match the downloaded binary.
+            // This can happen when a newer nightly overwrites the shared release
+            // asset after this build's manifest was embedded. As a fallback, fetch
+            // the live manifest from the release and verify against that.
+            if let releaseURL,
+               let liveManifest = Self.fetchRemoteManifestLocked(releaseURL: releaseURL, version: version),
+               let liveEntry = liveManifest.entry(goOS: entry.goOS, goArch: entry.goArch),
+               downloadedSHA == liveEntry.sha256.lowercased() {
+                debugLog("remote.download.checksum-fallback: embedded manifest checksum stale, live manifest matched for \(entry.assetName)")
+            } else {
+                throw NSError(domain: "cmux.remote.daemon", code: 28, userInfo: [
+                    NSLocalizedDescriptionKey: "remote daemon checksum mismatch for \(entry.assetName)",
+                ])
+            }
         }
 
         let tempURL = cacheURL.deletingLastPathComponent()
@@ -4006,7 +4315,7 @@ final class WorkspaceRemoteSessionController {
                 }
                 try? FileManager.default.removeItem(at: cacheURL)
             }
-            let downloadedURL = try downloadRemoteDaemonBinaryLocked(entry: entry, version: manifest.appVersion)
+            let downloadedURL = try downloadRemoteDaemonBinaryLocked(entry: entry, version: manifest.appVersion, releaseURL: manifest.releaseURL)
             debugLog("remote.build.downloaded path=\(downloadedURL.path)")
             return downloadedURL
         }
@@ -4561,6 +4870,11 @@ final class WorkspaceRemoteSessionController {
     private static func retrySuffix(retry: Int, delay: TimeInterval) -> String {
         let seconds = max(1, Int(delay.rounded()))
         return " (retry \(retry) in \(seconds)s)"
+    }
+
+    private static func retryDelay(baseDelay: TimeInterval, retry: Int) -> TimeInterval {
+        let exponent = Double(max(0, retry - 1))
+        return min(baseDelay * pow(2.0, exponent), 60.0)
     }
 
     private static func shouldEscalateProxyErrorToBootstrap(_ detail: String) -> Bool {
@@ -5248,14 +5562,21 @@ final class Workspace: Identifiable, ObservableObject {
     private var remoteLastDaemonErrorFingerprint: String?
     private var remoteLastPortConflictFingerprint: String?
     private var activeRemoteTerminalSurfaceIds: Set<UUID> = []
+    private var pendingRemoteTerminalChildExitSurfaceIds: Set<UUID> = []
 
     private static let remoteErrorStatusKey = "remote.error"
     private static let remotePortConflictStatusKey = "remote.port_conflicts"
+    private static let remoteNotificationCooldown: TimeInterval = 5 * 60
+    private static let sshControlMasterCleanupQueue = DispatchQueue(
+        label: "com.cmux.remote-ssh.control-master-cleanup",
+        qos: .utility
+    )
     private static let remoteHeartbeatDateFormatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter
     }()
+    nonisolated(unsafe) static var runSSHControlMasterCommandOverrideForTesting: (([String]) -> Void)?
     private var panelShellActivityStates: [UUID: PanelShellActivityState] = [:]
     /// PIDs associated with agent status entries (e.g. claude_code), keyed by status key.
     /// Used for stale-session detection: if the PID is dead, the status entry is cleared.
@@ -5279,6 +5600,20 @@ final class Workspace: Identifiable, ObservableObject {
     private var hasProxyOnlyRemoteSidebarError: Bool {
         guard let entry = statusEntries[Self.remoteErrorStatusKey]?.value else { return false }
         return entry.lowercased().contains("remote proxy unavailable")
+    }
+
+    private func remoteNotificationCooldownKey(target: String) -> String? {
+        let rawTarget = (remoteConfiguration?.destination ?? target)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawTarget.isEmpty else { return nil }
+        let normalizedHost = rawTarget
+            .split(separator: "@", maxSplits: 1, omittingEmptySubsequences: false)
+            .last
+            .map(String.init)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard let normalizedHost, !normalizedHost.isEmpty else { return nil }
+        return "remote-host:\(normalizedHost)"
     }
 
     var focusedSurfaceId: UUID? { focusedPanelId }
@@ -5402,7 +5737,7 @@ final class Workspace: Identifiable, ObservableObject {
         title: String = "Terminal",
         workingDirectory: String? = nil,
         portOrdinal: Int = 0,
-        configTemplate: ghostty_surface_config_s? = nil,
+        configTemplate: CmuxSurfaceConfigTemplate? = nil,
         initialTerminalCommand: String? = nil,
         initialTerminalEnvironment: [String: String] = [:]
     ) {
@@ -5572,6 +5907,7 @@ final class Workspace: Identifiable, ObservableObject {
     private var layoutFollowUpBrowserExitFocusPanelId: UUID?
     private var layoutFollowUpNeedsGeometryPass = false
     private var layoutFollowUpAttemptScheduled = false
+    private var layoutFollowUpAttemptVersion: Int = 0
     private var layoutFollowUpStalledAttemptCount = 0
     private var isAttemptingLayoutFollowUp = false
     private var isNormalizingPinnedTabOrder = false
@@ -5600,12 +5936,39 @@ final class Workspace: Identifiable, ObservableObject {
         let manuallyUnread: Bool
         let isRemoteTerminal: Bool
         let remoteRelayPort: Int?
+        let remoteCleanupConfiguration: WorkspaceRemoteConfiguration?
+
+        func withRemoteCleanupConfiguration(_ configuration: WorkspaceRemoteConfiguration?) -> Self {
+            Self(
+                panelId: panelId,
+                panel: panel,
+                title: title,
+                icon: icon,
+                iconImageData: iconImageData,
+                kind: kind,
+                isLoading: isLoading,
+                isPinned: isPinned,
+                directory: directory,
+                ttyName: ttyName,
+                cachedTitle: cachedTitle,
+                customTitle: customTitle,
+                manuallyUnread: manuallyUnread,
+                isRemoteTerminal: isRemoteTerminal,
+                remoteRelayPort: remoteRelayPort,
+                remoteCleanupConfiguration: configuration
+            )
+        }
     }
 
     private var detachingTabIds: Set<TabID> = []
     private var pendingDetachedSurfaces: [TabID: DetachedSurfaceTransfer] = [:]
     private var activeDetachCloseTransactions: Int = 0
     private var isDetachingCloseTransaction: Bool { activeDetachCloseTransactions > 0 }
+    // When the last live remote terminal is detached out, the source workspace may be
+    // closed immediately after the move succeeds. That teardown must not shut down the
+    // shared SSH control master that is still serving the moved terminal.
+    private var skipControlMasterCleanupAfterDetachedRemoteTransfer = false
+    private var transferredRemoteCleanupConfigurationsByPanelId: [UUID: WorkspaceRemoteConfiguration] = [:]
 
 #if DEBUG
     private func debugElapsedMs(since start: TimeInterval) -> String {
@@ -6449,6 +6812,11 @@ final class Workspace: Identifiable, ObservableObject {
         activeRemoteTerminalSurfaceIds.contains(panelId)
     }
 
+    @MainActor
+    func shouldDemoteWorkspaceAfterChildExit(surfaceId: UUID) -> Bool {
+        isRemoteWorkspace || pendingRemoteTerminalChildExitSurfaceIds.contains(surfaceId)
+    }
+
     var remoteDisplayTarget: String? {
         remoteConfiguration?.displayTarget
     }
@@ -6555,6 +6923,7 @@ final class Workspace: Identifiable, ObservableObject {
     }
 
     func configureRemoteConnection(_ configuration: WorkspaceRemoteConfiguration, autoConnect: Bool = true) {
+        skipControlMasterCleanupAfterDetachedRemoteTransfer = false
         remoteConfiguration = configuration
         seedInitialRemoteTerminalSessionIfNeeded(configuration: configuration)
         remoteDetectedPorts = []
@@ -6604,6 +6973,12 @@ final class Workspace: Identifiable, ObservableObject {
     }
 
     func disconnectRemoteConnection(clearConfiguration: Bool = false) {
+        let shouldCleanupControlMaster =
+            clearConfiguration
+            && !isDetachingCloseTransaction
+            && pendingDetachedSurfaces.isEmpty
+            && !skipControlMasterCleanupAfterDetachedRemoteTransfer
+        let configurationForCleanup = shouldCleanupControlMaster ? remoteConfiguration : nil
         let previousController = remoteSessionController
         activeRemoteSessionControllerID = nil
         remoteSessionController = nil
@@ -6626,14 +7001,18 @@ final class Workspace: Identifiable, ObservableObject {
         remoteLastPortConflictFingerprint = nil
         if clearConfiguration {
             remoteConfiguration = nil
+            skipControlMasterCleanupAfterDetachedRemoteTransfer = false
         }
         applyRemoteProxyEndpointUpdate(nil)
         applyBrowserRemoteWorkspaceStatusToPanels()
         recomputeListeningPorts()
+        if let configurationForCleanup {
+            Self.requestSSHControlMasterCleanupIfNeeded(configuration: configurationForCleanup)
+        }
     }
 
     private func clearRemoteConfigurationIfWorkspaceBecameLocal() {
-        guard panels.isEmpty, remoteConfiguration != nil else { return }
+        guard !isDetachingCloseTransaction, panels.isEmpty, remoteConfiguration != nil else { return }
         disconnectRemoteConnection(clearConfiguration: true)
     }
 
@@ -6650,6 +7029,9 @@ final class Workspace: Identifiable, ObservableObject {
     }
 
     private func trackRemoteTerminalSurface(_ panelId: UUID) {
+        skipControlMasterCleanupAfterDetachedRemoteTransfer = false
+        pendingRemoteTerminalChildExitSurfaceIds.remove(panelId)
+        transferredRemoteCleanupConfigurationsByPanelId.removeValue(forKey: panelId)
         guard activeRemoteTerminalSurfaceIds.insert(panelId).inserted else { return }
         activeRemoteTerminalSessionCount = activeRemoteTerminalSurfaceIds.count
     }
@@ -6657,6 +7039,7 @@ final class Workspace: Identifiable, ObservableObject {
     private func untrackRemoteTerminalSurface(_ panelId: UUID) {
         guard activeRemoteTerminalSurfaceIds.remove(panelId) != nil else { return }
         activeRemoteTerminalSessionCount = activeRemoteTerminalSurfaceIds.count
+        guard !isDetachingCloseTransaction else { return }
         maybeDemoteRemoteWorkspaceAfterSSHSessionEnded()
     }
 
@@ -6671,17 +7054,106 @@ final class Workspace: Identifiable, ObservableObject {
         }
     }
 
+    private func cleanupTransferredRemoteConnectionIfNeeded(surfaceId: UUID, relayPort: Int?) -> Bool {
+        guard let relayPort,
+              relayPort > 0,
+              let cleanupConfiguration = transferredRemoteCleanupConfigurationsByPanelId[surfaceId],
+              cleanupConfiguration.relayPort == relayPort else {
+            return false
+        }
+        transferredRemoteCleanupConfigurationsByPanelId.removeValue(forKey: surfaceId)
+        Self.requestSSHControlMasterCleanupIfNeeded(configuration: cleanupConfiguration)
+        return true
+    }
+
     func markRemoteTerminalSessionEnded(surfaceId: UUID, relayPort: Int?) {
+        if cleanupTransferredRemoteConnectionIfNeeded(surfaceId: surfaceId, relayPort: relayPort) {
+            return
+        }
         guard let relayPort,
               relayPort > 0,
               remoteConfiguration?.relayPort == relayPort else {
             return
         }
+        pendingRemoteTerminalChildExitSurfaceIds.insert(surfaceId)
         untrackRemoteTerminalSurface(surfaceId)
     }
 
     func teardownRemoteConnection() {
         disconnectRemoteConnection(clearConfiguration: true)
+    }
+
+    private static func requestSSHControlMasterCleanupIfNeeded(configuration: WorkspaceRemoteConfiguration) {
+        guard let arguments = sshControlMasterCleanupArguments(configuration: configuration) else { return }
+        if let override = runSSHControlMasterCommandOverrideForTesting {
+            override(arguments)
+            return
+        }
+
+        sshControlMasterCleanupQueue.async {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+            process.arguments = arguments
+            process.standardInput = FileHandle.nullDevice
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            let exitSemaphore = DispatchSemaphore(value: 0)
+            process.terminationHandler = { _ in
+                exitSemaphore.signal()
+            }
+
+            do {
+                try process.run()
+                if exitSemaphore.wait(timeout: .now() + 5) == .timedOut {
+                    if process.isRunning {
+                        process.terminate()
+                    }
+                    _ = exitSemaphore.wait(timeout: .now() + 1)
+                }
+            } catch {
+                return
+            }
+        }
+    }
+
+    private static func sshControlMasterCleanupArguments(configuration: WorkspaceRemoteConfiguration) -> [String]? {
+        let sshOptions = normalizedSSHControlCleanupOptions(configuration.sshOptions)
+        var arguments: [String] = [
+            "-o", "BatchMode=yes",
+            "-o", "ControlMaster=no",
+        ]
+        if let port = configuration.port {
+            arguments += ["-p", String(port)]
+        }
+        if let identityFile = configuration.identityFile?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !identityFile.isEmpty {
+            arguments += ["-i", identityFile]
+        }
+        for option in sshOptions {
+            arguments += ["-o", option]
+        }
+        arguments += ["-O", "exit", configuration.destination]
+        return arguments
+    }
+
+    private static func normalizedSSHControlCleanupOptions(_ options: [String]) -> [String] {
+        let disallowedKeys: Set<String> = ["controlmaster", "controlpersist"]
+        return options.compactMap { option in
+            let trimmed = option.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            guard let key = sshOptionKeyForControlCleanup(trimmed) else { return nil }
+            return disallowedKeys.contains(key) ? nil : trimmed
+        }
+    }
+
+    private static func sshOptionKeyForControlCleanup(_ option: String) -> String? {
+        let trimmed = option.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return trimmed
+            .split(whereSeparator: { $0 == "=" || $0.isWhitespace })
+            .first
+            .map(String.init)?
+            .lowercased()
     }
 
     func applyRemoteConnectionStateUpdate(
@@ -6732,13 +7204,15 @@ final class Workspace: Identifiable, ObservableObject {
                     surfaceId: nil,
                     title: notificationTitle,
                     subtitle: target,
-                    body: trimmedDetail
+                    body: trimmedDetail,
+                    cooldownKey: remoteNotificationCooldownKey(target: target),
+                    cooldownInterval: Self.remoteNotificationCooldown
                 )
             }
             return
         }
 
-        if !preserveConnectedStateForRetry && state != .error {
+        if state == .connected {
             statusEntries.removeValue(forKey: Self.remoteErrorStatusKey)
             remoteLastErrorFingerprint = nil
         }
@@ -6823,9 +7297,9 @@ final class Workspace: Identifiable, ObservableObject {
 
     private func seedTerminalInheritanceFontPoints(
         panelId: UUID,
-        configTemplate: ghostty_surface_config_s?
+        configTemplate: CmuxSurfaceConfigTemplate?
     ) {
-        guard let fontPoints = configTemplate?.font_size, fontPoints > 0 else { return }
+        guard let fontPoints = configTemplate?.fontSize, fontPoints > 0 else { return }
         terminalInheritanceFontPointsByPanelId[panelId] = fontPoints
         lastTerminalConfigInheritanceFontPoints = fontPoints
     }
@@ -6833,7 +7307,7 @@ final class Workspace: Identifiable, ObservableObject {
     private func resolvedTerminalInheritanceFontPoints(
         for terminalPanel: TerminalPanel,
         sourceSurface: ghostty_surface_t,
-        inheritedConfig: ghostty_surface_config_s
+        inheritedConfig: CmuxSurfaceConfigTemplate
     ) -> Float? {
         let runtimePoints = cmuxCurrentSurfaceFontSizePoints(sourceSurface)
         if let rooted = terminalInheritanceFontPointsByPanelId[terminalPanel.id], rooted > 0 {
@@ -6844,16 +7318,15 @@ final class Workspace: Identifiable, ObservableObject {
             }
             return rooted
         }
-        if inheritedConfig.font_size > 0 {
-            return inheritedConfig.font_size
+        if inheritedConfig.fontSize > 0 {
+            return inheritedConfig.fontSize
         }
         return runtimePoints
     }
 
     private func rememberTerminalConfigInheritanceSource(_ terminalPanel: TerminalPanel) {
         lastTerminalConfigInheritancePanelId = terminalPanel.id
-        if terminalPanel.surface.hasLiveSurface,
-           let sourceSurface = terminalPanel.surface.surface,
+        if let sourceSurface = terminalPanel.surface.surface,
            let runtimePoints = cmuxCurrentSurfaceFontSizePoints(sourceSurface) {
             let existing = terminalInheritanceFontPointsByPanelId[terminalPanel.id]
             if existing == nil || abs((existing ?? runtimePoints) - runtimePoints) > 0.05 {
@@ -6944,15 +7417,20 @@ final class Workspace: Identifiable, ObservableObject {
     private func inheritedTerminalConfig(
         preferredPanelId: UUID? = nil,
         inPane preferredPaneId: PaneID? = nil
-    ) -> ghostty_surface_config_s? {
-        // Walk candidates in priority order and use the first panel with a live surface.
-        // This avoids returning nil when the top candidate exists but is not attached yet.
+    ) -> CmuxSurfaceConfigTemplate? {
+        // Walk candidates in priority order and use the first panel that still exposes
+        // a runtime surface pointer.
         for terminalPanel in terminalPanelConfigInheritanceCandidates(
             preferredPanelId: preferredPanelId,
             inPane: preferredPaneId
         ) {
-            guard terminalPanel.surface.hasLiveSurface,
-                  let sourceSurface = terminalPanel.surface.surface else { continue }
+            // Pin the panel and its TerminalSurface wrapper for the duration of
+            // this iteration. The raw ghostty_surface_t extracted below is owned
+            // by `surface` (the TerminalSurface) — ARC must not release it while
+            // ghostty_surface_inherited_config or cmuxCurrentSurfaceFontSizePoints
+            // is still reading through the pointer.
+            let surface = terminalPanel.surface
+            guard let sourceSurface = surface.surface else { continue }
             var config = cmuxInheritedSurfaceConfig(
                 sourceSurface: sourceSurface,
                 context: GHOSTTY_SURFACE_CONTEXT_SPLIT
@@ -6962,19 +7440,21 @@ final class Workspace: Identifiable, ObservableObject {
                 sourceSurface: sourceSurface,
                 inheritedConfig: config
             ), rootedFontPoints > 0 {
-                config.font_size = rootedFontPoints
+                config.fontSize = rootedFontPoints
                 terminalInheritanceFontPointsByPanelId[terminalPanel.id] = rootedFontPoints
             }
+            // Prevent ARC from releasing panel/surface before the C calls above complete.
+            withExtendedLifetime((terminalPanel, surface)) {}
             rememberTerminalConfigInheritanceSource(terminalPanel)
-            if config.font_size > 0 {
-                lastTerminalConfigInheritanceFontPoints = config.font_size
+            if config.fontSize > 0 {
+                lastTerminalConfigInheritanceFontPoints = config.fontSize
             }
             return config
         }
 
         if let fallbackFontPoints = lastTerminalConfigInheritanceFontPoints {
-            var config = ghostty_surface_config_new()
-            config.font_size = fallbackFontPoints
+            var config = CmuxSurfaceConfigTemplate()
+            config.fontSize = fallbackFontPoints
 #if DEBUG
             dlog(
                 "zoom.inherit fallback=lastKnownFont context=split font=\(String(format: "%.2f", fallbackFontPoints))"
@@ -7467,6 +7947,7 @@ final class Workspace: Identifiable, ObservableObject {
         panels.removeAll(keepingCapacity: false)
         surfaceIdToPanelId.removeAll(keepingCapacity: false)
         panelSubscriptions.removeAll(keepingCapacity: false)
+        pendingRemoteTerminalChildExitSurfaceIds.removeAll(keepingCapacity: false)
         pruneSurfaceMetadata(validSurfaceIds: [])
         restoredTerminalScrollbackByPanelId.removeAll(keepingCapacity: false)
         terminalInheritanceFontPointsByPanelId.removeAll(keepingCapacity: false)
@@ -7851,6 +8332,9 @@ final class Workspace: Identifiable, ObservableObject {
     func detachSurface(panelId: UUID) -> DetachedSurfaceTransfer? {
         guard let tabId = surfaceIdFromPanelId(panelId) else { return nil }
         guard panels[panelId] != nil else { return nil }
+        let shouldSkipControlMasterCleanupAfterDetach =
+            activeRemoteTerminalSurfaceIds.contains(panelId)
+            && activeRemoteTerminalSurfaceIds.count == 1
 #if DEBUG
         let detachStart = ProcessInfo.processInfo.systemUptime
         dlog(
@@ -7877,7 +8361,13 @@ final class Workspace: Identifiable, ObservableObject {
             return nil
         }
 
-        let detached = pendingDetachedSurfaces.removeValue(forKey: tabId)
+        var detached = pendingDetachedSurfaces.removeValue(forKey: tabId)
+        if shouldSkipControlMasterCleanupAfterDetach, let detachedTransfer = detached, detachedTransfer.isRemoteTerminal {
+            skipControlMasterCleanupAfterDetachedRemoteTransfer = true
+            if detachedTransfer.remoteCleanupConfiguration == nil {
+                detached = detachedTransfer.withRemoteCleanupConfiguration(remoteConfiguration)
+            }
+        }
 #if DEBUG
         dlog(
             "split.detach.end ws=\(id.uuidString.prefix(5)) panel=\(panelId.uuidString.prefix(5)) " +
@@ -7992,10 +8482,20 @@ final class Workspace: Identifiable, ObservableObject {
         }
 
         surfaceIdToPanelId[newTabId] = detached.panelId
-        if detached.isRemoteTerminal,
-           let detachedRelayPort = detached.remoteRelayPort,
-           detachedRelayPort == remoteConfiguration?.relayPort {
+        let didAdoptWorkspaceRemoteTracking =
+            detached.isRemoteTerminal
+            && detached.remoteRelayPort == remoteConfiguration?.relayPort
+        if didAdoptWorkspaceRemoteTracking {
             trackRemoteTerminalSurface(detached.panelId)
+        }
+        if let cleanupConfiguration = detached.remoteCleanupConfiguration {
+            if didAdoptWorkspaceRemoteTracking {
+                transferredRemoteCleanupConfigurationsByPanelId.removeValue(forKey: detached.panelId)
+            } else {
+                transferredRemoteCleanupConfigurationsByPanelId[detached.panelId] = cleanupConfiguration
+            }
+        } else {
+            transferredRemoteCleanupConfigurationsByPanelId.removeValue(forKey: detached.panelId)
         }
         if let index {
             _ = bonsplitController.reorderTab(newTabId, toIndex: index)
@@ -8555,12 +9055,26 @@ final class Workspace: Identifiable, ObservableObject {
         }
         layoutFollowUpNeedsGeometryPass = layoutFollowUpNeedsGeometryPass || includeGeometry
         layoutFollowUpStalledAttemptCount = 0
+        // Invalidate any pending retry whose delay was computed from a stale stall count.
+        // Incrementing the version causes old closures to exit early; clearing the flag
+        // allows scheduleLayoutFollowUpAttempt() below to enqueue a fresh asyncAfter(0).
+        layoutFollowUpAttemptVersion &+= 1
+        layoutFollowUpAttemptScheduled = false
 
         if layoutFollowUpTimeoutWorkItem == nil {
             installLayoutFollowUpObservers()
         }
         refreshLayoutFollowUpTimeout()
-        attemptEventDrivenLayoutFollowUp()
+        // Use async scheduling instead of a synchronous call here. beginEventDrivenLayoutFollowUp
+        // is often invoked from splitTabBar(_:didChangeGeometry:), which fires from inside
+        // SwiftUI's .onChange(of: geometry) during an active layout pass. Calling
+        // attemptEventDrivenLayoutFollowUp() synchronously in that context causes
+        // flushWorkspaceWindowLayouts() → displayIfNeeded() to be called re-entrantly,
+        // incrementing AppKit's per-window constraint-pass counter on every display cycle
+        // until it exceeds the limit and crashes with NSGenericException.
+        // scheduleLayoutFollowUpAttempt() defers via asyncAfter(0) so the flush always
+        // happens after the current layout pass completes.
+        scheduleLayoutFollowUpAttempt()
     }
 
     private func installLayoutFollowUpObservers() {
@@ -8647,6 +9161,7 @@ final class Workspace: Identifiable, ObservableObject {
         layoutFollowUpBrowserPanelId = nil
         layoutFollowUpBrowserExitFocusPanelId = nil
         layoutFollowUpNeedsGeometryPass = false
+        layoutFollowUpAttemptVersion &+= 1
         layoutFollowUpAttemptScheduled = false
         layoutFollowUpStalledAttemptCount = 0
     }
@@ -8657,8 +9172,10 @@ final class Workspace: Identifiable, ObservableObject {
 
         layoutFollowUpAttemptScheduled = true
         let delay = layoutFollowUpBackoffDelay()
+        let version = layoutFollowUpAttemptVersion
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
+            guard self.layoutFollowUpAttemptVersion == version else { return }
             self.layoutFollowUpAttemptScheduled = false
             self.attemptEventDrivenLayoutFollowUp()
         }
@@ -9386,6 +9903,16 @@ extension Workspace: BonsplitDelegate {
         }
     }
 
+    /// Hide browser portals for tabs that are no longer selected in the given pane.
+    private func hideBrowserPortalsForDeselectedTabs(inPane pane: PaneID, selectedTabId: TabID) {
+        for tab in bonsplitController.tabs(inPane: pane) {
+            guard tab.id != selectedTabId else { continue }
+            guard let panelId = panelIdFromSurfaceId(tab.id),
+                  let browserPanel = panels[panelId] as? BrowserPanel else { continue }
+            browserPanel.hideBrowserPortalView(source: "tabDeselected")
+        }
+    }
+
     private func applyTabSelectionNow(
         tabId: TabID,
         inPane pane: PaneID,
@@ -9464,6 +9991,13 @@ extension Workspace: BonsplitDelegate {
         for (id, p) in panels where id != effectiveFocusedPanelId {
             p.unfocus()
         }
+
+        // Explicitly hide browser portals for deselected tabs in this pane.
+        // Bonsplit's keepAllAlive mode hides non-selected tabs via SwiftUI .opacity(0),
+        // but portal-hosted WKWebViews render at the window level in AppKit and are not
+        // affected by SwiftUI opacity. Without an explicit hide, the deselected browser's
+        // portal layer can remain visible above the newly selected tab.
+        hideBrowserPortalsForDeselectedTabs(inPane: focusedPane, selectedTabId: selectedTabId)
 
         if let focusWindow = activationWindow(for: panel) {
             yieldForeignOwnedFocusIfNeeded(
@@ -9816,6 +10350,7 @@ extension Workspace: BonsplitDelegate {
         #endif
 
         let panel = panels[panelId]
+        let transferredRemoteCleanupConfiguration = transferredRemoteCleanupConfigurationsByPanelId.removeValue(forKey: panelId)
 
         if isDetaching, let panel {
             let browserPanel = panel as? BrowserPanel
@@ -9838,7 +10373,8 @@ extension Workspace: BonsplitDelegate {
                 isRemoteTerminal: activeRemoteTerminalSurfaceIds.contains(panelId),
                 remoteRelayPort: activeRemoteTerminalSurfaceIds.contains(panelId)
                     ? remoteConfiguration?.relayPort
-                    : nil
+                    : nil,
+                remoteCleanupConfiguration: transferredRemoteCleanupConfiguration
             )
         } else {
             if let closedBrowserRestoreSnapshot {
@@ -9849,6 +10385,7 @@ extension Workspace: BonsplitDelegate {
 
         panels.removeValue(forKey: panelId)
         untrackRemoteTerminalSurface(panelId)
+        pendingRemoteTerminalChildExitSurfaceIds.remove(panelId)
         surfaceIdToPanelId.removeValue(forKey: tabId)
         panelDirectories.removeValue(forKey: panelId)
         panelGitBranches.removeValue(forKey: panelId)
@@ -9868,6 +10405,9 @@ extension Workspace: BonsplitDelegate {
             lastTerminalConfigInheritancePanelId = nil
         }
         clearRemoteConfigurationIfWorkspaceBecameLocal()
+        if !isDetaching, let transferredRemoteCleanupConfiguration {
+            Self.requestSSHControlMasterCleanupIfNeeded(configuration: transferredRemoteCleanupConfiguration)
+        }
         AppDelegate.shared?.notificationStore?.clearNotifications(forTabId: id, surfaceId: panelId)
 
         // Keep the workspace invariant for normal close paths.
@@ -9999,6 +10539,7 @@ extension Workspace: BonsplitDelegate {
                 panels[panelId]?.close()
                 panels.removeValue(forKey: panelId)
                 untrackRemoteTerminalSurface(panelId)
+                pendingRemoteTerminalChildExitSurfaceIds.remove(panelId)
                 panelDirectories.removeValue(forKey: panelId)
                 panelGitBranches.removeValue(forKey: panelId)
                 panelPullRequests.removeValue(forKey: panelId)

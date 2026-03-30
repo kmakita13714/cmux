@@ -1731,6 +1731,31 @@ final class GhosttySurfaceOverlayTests: XCTestCase {
         return false
     }
 
+    @discardableResult
+    private func waitUntil(
+        timeout: TimeInterval = 1.0,
+        description: String,
+        file: StaticString = #filePath,
+        line: UInt = #line,
+        _ condition: @escaping () -> Bool
+    ) -> Bool {
+        let expectation = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in
+                if Thread.isMainThread {
+                    return condition()
+                }
+                return DispatchQueue.main.sync(execute: condition)
+            },
+            object: NSObject()
+        )
+        let result = XCTWaiter().wait(for: [expectation], timeout: timeout)
+        guard result == .completed else {
+            XCTFail("Timed out waiting for \(description)", file: file, line: line)
+            return false
+        }
+        return true
+    }
+
     func testTrackpadScrollRoutesToTerminalSurfaceAndPreservesKeyboardFocusPath() {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 360, height: 240),
@@ -2045,11 +2070,15 @@ final class GhosttySurfaceOverlayTests: XCTestCase {
 
         let searchState = TerminalSurface.SearchState(needle: "example")
         hostedView.setSearchOverlay(searchState: searchState)
-        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        waitUntil(description: "search overlay to mount") {
+            hostedView.debugHasSearchOverlay()
+        }
         XCTAssertTrue(hostedView.debugHasSearchOverlay())
 
         hostedView.setSearchOverlay(searchState: nil)
-        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        waitUntil(description: "search overlay to unmount") {
+            !hostedView.debugHasSearchOverlay()
+        }
         XCTAssertFalse(hostedView.debugHasSearchOverlay())
     }
 
@@ -2342,12 +2371,17 @@ final class GhosttySurfaceOverlayTests: XCTestCase {
             )
             weakSurface = surface
             let hostedView = surface.hostedView
-            hostedView.setSearchOverlay(searchState: TerminalSurface.SearchState(needle: "retain-check"))
-            return hostedView
+        hostedView.setSearchOverlay(searchState: TerminalSurface.SearchState(needle: "retain-check"))
+        return hostedView
         }()
 
-        RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        waitUntil(description: "search overlay to mount") {
+            hostedView.debugHasSearchOverlay()
+        }
         XCTAssertTrue(hostedView.debugHasSearchOverlay())
+        waitUntil(description: "terminal surface to deallocate after search overlay mount") {
+            weakSurface == nil
+        }
         XCTAssertNil(weakSurface, "Mounted search overlay must not retain TerminalSurface")
     }
 
@@ -2594,6 +2628,71 @@ final class TerminalWindowPortalLifecycleTests: XCTestCase {
 
         XCTAssertEqual(portal.debugEntryCount(), 1, "Only the live anchored hosted view should remain tracked")
         XCTAssertEqual(portal.debugHostedSubviewCount(), 1, "Stale anchorless hosted views should be detached from hostView")
+    }
+
+    func testDeferredSyncHidesVisibleHostedViewAfterAnchorDisappears() {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 320),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        defer { window.orderOut(nil) }
+        realizeWindowLayout(window)
+
+        let portal = WindowTerminalPortal(window: window)
+        guard let contentView = window.contentView else {
+            XCTFail("Expected content view")
+            return
+        }
+
+        var retiredAnchor: NSView? = NSView(frame: NSRect(x: 24, y: 28, width: 96, height: 180))
+        contentView.addSubview(retiredAnchor!)
+
+        let retiredTerminal = GhosttyNSView(frame: NSRect(x: 0, y: 0, width: 96, height: 180))
+        let retiredHosted = GhosttySurfaceScrollView(surfaceView: retiredTerminal)
+        portal.bind(hostedView: retiredHosted, to: retiredAnchor!, visibleInUI: true)
+        portal.synchronizeHostedViewForAnchor(retiredAnchor!)
+
+        let retiredWindowPoint = retiredAnchor!.convert(
+            NSPoint(x: retiredAnchor!.bounds.midX, y: retiredAnchor!.bounds.midY),
+            to: nil
+        )
+        XCTAssertTrue(
+            portal.terminalViewAtWindowPoint(retiredWindowPoint) === retiredTerminal,
+            "Initial hit-testing should resolve the first hosted terminal at its anchor"
+        )
+
+        retiredAnchor?.removeFromSuperview()
+        retiredAnchor = nil
+
+        let activeAnchor = NSView(frame: NSRect(x: 184, y: 28, width: 280, height: 180))
+        contentView.addSubview(activeAnchor)
+
+        let activeTerminal = GhosttyNSView(frame: NSRect(x: 0, y: 0, width: 280, height: 180))
+        let activeHosted = GhosttySurfaceScrollView(surfaceView: activeTerminal)
+        portal.bind(hostedView: activeHosted, to: activeAnchor, visibleInUI: true)
+        portal.synchronizeHostedViewForAnchor(activeAnchor)
+
+        XCTAssertTrue(
+            retiredHosted.isHidden,
+            "A visible hosted terminal whose anchor vanished should hide as soon as the replacement anchor sync runs"
+        )
+        // Drain the queued full-sync turn so the portal clears any stale hit-test region left by the rebind.
+        drainMainQueue()
+
+        let activeWindowPoint = activeAnchor.convert(
+            NSPoint(x: activeAnchor.bounds.midX, y: activeAnchor.bounds.midY),
+            to: nil
+        )
+        XCTAssertNil(
+            portal.terminalViewAtWindowPoint(retiredWindowPoint),
+            "Restore-like rebinds should clear stale portal hit regions on the queued portal resync"
+        )
+        XCTAssertTrue(
+            portal.terminalViewAtWindowPoint(activeWindowPoint) === activeTerminal,
+            "The active terminal should remain visible after the stale hosted view is hidden"
+        )
     }
 
     func testSynchronizeReusesInstalledTargetWithoutRepeatedContentViewLookup() {
